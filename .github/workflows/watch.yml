@@ -1,0 +1,57 @@
+# Watches overlook.technology from outside it, because Overlook can't tell its owner it is down.
+# Every 10 minutes GitHub calls /api/health?jobs=1. That answers 503 when Overlook or its database
+# is down, or when its scheduled collections have stopped. Three failures in a row fail the run,
+# and GitHub emails the owner. Nothing here is secret, and Actions minutes are free in a public repo.
+name: Watch Overlook
+
+on:
+  schedule:
+    - cron: "*/10 * * * *" # the watch
+    - cron: "7 6 * * *" # once a day: the keep-alive
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Check this URL instead, to see what a failure looks like"
+        required: false
+
+permissions:
+  contents: write # only for the keep-alive commit
+
+concurrency:
+  group: watch
+
+jobs:
+  watch:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '*/10 * * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Overlook answers, and its crons ran in the last 10 minutes
+        env:
+          URL: ${{ inputs.url || 'https://overlook.technology/api/health?jobs=1' }}
+        run: |
+          for try in 1 2 3; do
+            code=$(curl -s -o body.json -w '%{http_code}' --max-time 20 "$URL" || true)
+            echo "try $try: ${code:-no answer} $(cat body.json 2>/dev/null)"
+            if [ "$code" = 200 ] && grep -q '"ok":true' body.json; then exit 0; fi
+            if [ "$try" -lt 3 ]; then sleep 45; fi
+          done
+          echo "::error title=Overlook is down::$URL failed three times in a row (last answer: ${code:-none}). A 503 with lastCollectionSecondsAgo means the crons stopped; no answer means the site is down. Check https://vercel.com/xaxis-projects/overlook."
+          exit 1
+
+  keep-alive:
+    # GitHub turns off schedules in a public repo after 60 days without a commit.
+    if: github.event.schedule == '7 6 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Commit an empty keep-alive when the repo has been quiet for 50 days
+        run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 50 * 86400 )) ]; then
+            git -c user.name=Xaxis -c user.email=william.neeley@gmail.com commit --allow-empty -m "Keep the watch scheduled"
+            git push
+          else
+            echo "last commit $(( ($(date +%s) - last) / 86400 )) days ago; nothing to do"
+          fi
